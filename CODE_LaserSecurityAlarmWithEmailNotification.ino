@@ -1,0 +1,459 @@
+//Developed by Nahiyan Ahmed
+
+#include <Arduino.h>
+#if defined(ESP32)
+  #include <WiFi.h>
+#elif defined(ESP8266)
+  #include <ESP8266WiFi.h>
+#endif
+#include <ESP_Mail_Client.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#define WIFI_SSID "iPhone"           //Change the text inside "" to your wifi name/ssid
+#define WIFI_PASSWORD "anonto191593"   //Change the text inside "" to your wifi password
+
+#define SMTP_HOST "smtp.gmail.com"
+#define SMTP_PORT 465
+
+#define AUTHOR_EMAIL "esp.is.smart@gmail.com"     //Change the text inside "" to the new email you made for the device
+#define AUTHOR_PASSWORD "agjm ifsp teqn lyka"   //Change the text inside "" to the app password of the new email you made for the device
+
+#define RECIPIENT_EMAIL "hasanurz341@gmail.com" //Change the text inside "" to the email you want the notifications to go to
+
+#define PHOTO_RESISTOR_PIN 35
+#define BUZZER_PIN 5
+#define ALWAYS_HIGH_PIN 12
+#define LED_PIN 2
+
+#define LEFT_BUTTON_PIN 18
+#define RIGHT_BUTTON_PIN 19
+#define SELECT_BUTTON_PIN 15
+#define UP_BUTTON_PIN 23
+#define DOWN_BUTTON_PIN 4
+
+#define BUTTON_HOLD_TIME 5000 // 5 seconds
+#define DEBOUNCE_DELAY 200 // 200 milliseconds
+#define CONFIRM_DELAY 1000 // 1 second
+
+Adafruit_SSD1306 display(128, 64, &Wire, -1);
+
+SMTPSession smtp;
+
+/* Declare the Session_Config for user defined session credentials */
+Session_Config config;
+
+bool alarmTriggered = false;
+bool smtpConnected = false;
+bool smtpAttempted = false;
+unsigned long lastAttemptTime = 0;
+unsigned long authTimeout = 60000; // 1 minute
+unsigned long failDisplayTime = 60000; // 1 minute
+
+String newSSID = "";
+String newPassword = "";
+
+enum State {
+  NORMAL,
+  SET_SSID,
+  SET_PASSWORD
+};
+
+State state = NORMAL;
+
+#define KEYBOARD_ROWS 7
+#define KEYBOARD_COLS 6
+
+char keyboard[KEYBOARD_ROWS][KEYBOARD_COLS] = {
+  {'1', '2', '3', '4', '5', '6'},
+  {'7', '8', '9', '0', 'a', 'b'},
+  {'c', 'd', 'e', 'f', 'g', 'h'},
+  {'i', 'j', 'k', 'l', 'm', 'n'},
+  {'o', 'p', 'q', 'r', 's', 't'},
+  {'u', 'v', 'w', 'x', 'y', 'z'},
+  {'#', '-', '_', ' ', '^', '<'}
+};
+
+int currentRow = 0;
+int currentCol = 0;
+int displayRow = 0;
+bool upperCase = false;
+bool upDownButtonPressed = false;
+unsigned long lastButtonPressTime = 0;
+unsigned long lastUpDownButtonPressTime = 0;
+
+void smtpCallback(SMTP_Status status);
+void smtpConnect();
+void sendEmail();
+void connectToNewWiFi();
+void retryWiFiConnection();
+void handleButtonPresses();
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println();
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println(F("SSD1306 allocation failed"));
+    for(;;);
+  }
+  Wire.begin(21, 22);
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println(F("Wi-Fi Connecting     Hold LEFT and RIGHT to enter new wifi credentials and press UP and DOWN together to confirm"));
+  display.display();
+
+  // Initialize WiFi
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  smtp.debug(1);
+
+  smtp.callback(smtpCallback);
+
+  /* Set the session config */
+  config.server.host_name = SMTP_HOST;
+  config.server.port = SMTP_PORT;
+  config.login.email = AUTHOR_EMAIL;
+  config.login.password = AUTHOR_PASSWORD;
+  config.login.user_domain = "";
+
+  pinMode(PHOTO_RESISTOR_PIN, INPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(ALWAYS_HIGH_PIN, OUTPUT);
+  digitalWrite(ALWAYS_HIGH_PIN, HIGH);
+  pinMode(LED_PIN, OUTPUT);
+
+  pinMode(LEFT_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(RIGHT_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(SELECT_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(UP_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(DOWN_BUTTON_PIN, INPUT_PULLUP);
+}
+
+void loop() {
+  int photoResistorState = digitalRead(PHOTO_RESISTOR_PIN);
+
+  // Start the alarm if the DO light on the photoresistor module is off
+  if (photoResistorState == HIGH && !alarmTriggered) {
+    alarmTriggered = true;
+    // Turn on the buzzer
+    digitalWrite(BUZZER_PIN, HIGH);
+    // Send email
+    if (smtpConnected) {
+      sendEmail();
+    }
+  }
+
+  // Check if WiFi is connected and turn on the LED
+  if (WiFi.status() == WL_CONNECTED) {
+    digitalWrite(LED_PIN, HIGH); // Turn on the LED
+    if (!smtpConnected && (millis() - lastAttemptTime >= failDisplayTime || !smtpAttempted)) {
+      display.clearDisplay();
+      display.setCursor(0, 0);
+      display.println(F("Wi-Fi Connected"));
+      display.setCursor(0, 10);
+      display.println(F("SMTP Authenticating  ......"));
+      display.display();
+      smtpConnect();
+    }
+  } else {
+    digitalWrite(LED_PIN, LOW); // Turn off the LED
+  }
+
+  // Check if left and right buttons are held down together for 5 seconds
+  if (digitalRead(LEFT_BUTTON_PIN) == LOW && digitalRead(RIGHT_BUTTON_PIN) == LOW && millis() - lastButtonPressTime > DEBOUNCE_DELAY) {
+    unsigned long startTime = millis();
+    while (digitalRead(LEFT_BUTTON_PIN) == LOW && digitalRead(RIGHT_BUTTON_PIN) == LOW) {
+      if (millis() - startTime >= BUTTON_HOLD_TIME) {
+        state = SET_SSID;
+        newSSID = "";
+        newPassword = "";
+        display.clearDisplay();
+        display.setCursor(0, 0);
+        display.println(F("Enter new SSID:"));
+        display.display();
+        // Disconnect from default WiFi
+        WiFi.disconnect(true);
+        delay(1000);
+        break;
+      }
+    }
+    lastButtonPressTime = millis();
+  }
+
+  if (state == SET_SSID || state == SET_PASSWORD) {
+    // Display the keyboard
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    if (state == SET_SSID) {
+      display.println(F("Enter new SSID:"));
+      display.println(newSSID);
+    } else if (state == SET_PASSWORD) {
+      display.println(F("Enter new password:"));
+      display.println(newPassword);
+    }
+    for (int i = 0; i < 4; i++) {
+      int row = (i + displayRow) % KEYBOARD_ROWS; // Calculate actual row considering scrolling
+      for (int j = 0; j < KEYBOARD_COLS; j++) {
+        if (row == currentRow && j == currentCol) {
+          display.print('[');
+          display.print(keyboard[row][j]);
+          display.print(']');
+        } else {
+          display.print(' ');
+          display.print(keyboard[row][j]);
+          display.print(' ');
+        }
+      }
+      display.println();
+    }
+    display.display();
+
+    handleButtonPresses();
+  }
+}
+
+void handleButtonPresses() {
+  // Check if select button is pressed
+  if (digitalRead(SELECT_BUTTON_PIN) == LOW && millis() - lastButtonPressTime > DEBOUNCE_DELAY) {
+    lastButtonPressTime = millis();
+    char selectedChar = keyboard[currentRow][currentCol];
+    if (selectedChar == '^') {
+      upperCase = !upperCase;
+      if (upperCase) {
+        for (int i = 0; i < KEYBOARD_ROWS; i++) {
+          for (int j = 0; j < KEYBOARD_COLS; j++) {
+            if (isalpha(keyboard[i][j])) {
+              keyboard[i][j] = toupper(keyboard[i][j]);
+            }
+          }
+        }
+      } else {
+        for (int i = 0; i < KEYBOARD_ROWS; i++) {
+          for (int j = 0; j < KEYBOARD_COLS; j++) {
+            if (isalpha(keyboard[i][j])) {
+              keyboard[i][j] = tolower(keyboard[i][j]);
+            }
+          }
+        }
+      }
+    } else if (selectedChar == '<') {
+      if (state == SET_SSID && newSSID.length() > 0) {
+        newSSID.remove(newSSID.length() - 1);
+      } else if (state == SET_PASSWORD && newPassword.length() > 0) {
+        newPassword.remove(newPassword.length() - 1);
+      }
+    } else {
+      if (state == SET_SSID) {
+        newSSID += selectedChar;
+      } else if (state == SET_PASSWORD) {
+        newPassword += selectedChar;
+      }
+    }
+    delay(DEBOUNCE_DELAY); // Debounce delay
+  }
+
+  // Check if up and down buttons are held down together
+  if (digitalRead(UP_BUTTON_PIN) == LOW && digitalRead(DOWN_BUTTON_PIN) == LOW && millis() - lastUpDownButtonPressTime > CONFIRM_DELAY && !upDownButtonPressed) {
+    upDownButtonPressed = true;
+    lastUpDownButtonPressTime = millis();
+  }
+
+  if (upDownButtonPressed && (digitalRead(UP_BUTTON_PIN) == HIGH || digitalRead(DOWN_BUTTON_PIN) == HIGH)) {
+    if (state == SET_SSID) {
+      state = SET_PASSWORD;
+      currentRow = min(currentRow, KEYBOARD_ROWS - 1); // Ensure cursor stays within bounds
+      currentCol = min(currentCol, KEYBOARD_COLS - 1);
+    } else if (state == SET_PASSWORD) {
+      state = NORMAL;
+      connectToNewWiFi();
+    }
+    upDownButtonPressed = false;
+    delay(DEBOUNCE_DELAY); // Debounce delay
+  }
+
+  // Check if up button is pressed
+  if (digitalRead(UP_BUTTON_PIN) == LOW && millis() - lastButtonPressTime > DEBOUNCE_DELAY) {
+    lastButtonPressTime = millis();
+    if (currentRow > 0) {
+      currentRow--; // Only decrement if not already on the top row
+      if (currentRow < displayRow) {
+        displayRow = currentRow;
+      }
+    }
+    delay(DEBOUNCE_DELAY); // Debounce delay
+  }
+
+  // Check if down button is pressed
+  if (digitalRead(DOWN_BUTTON_PIN) == LOW && millis() - lastButtonPressTime > DEBOUNCE_DELAY) {
+    lastButtonPressTime = millis();
+    if (currentRow < KEYBOARD_ROWS - 1) {
+      currentRow++; // Only increment if not already on the bottom row
+      if (currentRow >= displayRow + 4) {
+        displayRow = (displayRow + 1) % KEYBOARD_ROWS;
+      }
+    }
+    delay(DEBOUNCE_DELAY); // Debounce delay
+  }
+
+  // Check if left button is pressed
+  if (digitalRead(LEFT_BUTTON_PIN) == LOW && millis() - lastButtonPressTime > DEBOUNCE_DELAY) {
+    lastButtonPressTime = millis();
+    currentCol = (currentCol - 1 + KEYBOARD_COLS) % KEYBOARD_COLS;
+    delay(DEBOUNCE_DELAY); // Debounce delay
+  }
+
+  // Check if right button is pressed
+  if (digitalRead(RIGHT_BUTTON_PIN) == LOW && millis() - lastButtonPressTime > DEBOUNCE_DELAY) {
+    lastButtonPressTime = millis();
+    currentCol = (currentCol + 1) % KEYBOARD_COLS;
+    delay(DEBOUNCE_DELAY); // Debounce delay
+  }
+}
+
+void connectToNewWiFi() {
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.println(F("Connecting to new    Wi-Fi ..."));
+  display.display();
+  WiFi.begin(newSSID.c_str(), newPassword.c_str());
+
+  unsigned long startTime = millis();
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED) {
+    if (millis() - startTime > 10000) { // Timeout after 10 seconds
+      attempts++;
+      if (attempts >= 50) {
+        display.clearDisplay();
+        display.setCursor(0, 0);
+        display.println(F("Failed to connect to new Wi-Fi"));
+        display.display();
+        break;
+      }
+      retryWiFiConnection();
+      startTime = millis(); // Reset timer for next attempt
+    }
+    delay(1000);
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.println(F("Connected to new    Wi-Fi"));
+    display.display();
+  }
+}
+
+void retryWiFiConnection() {
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED) {
+    WiFi.begin(newSSID.c_str(), newPassword.c_str());
+    delay(5000); // Wait 5 seconds before retrying
+    attempts++;
+    if (attempts > 3) { // Maximum of 3 retry attempts
+      display.clearDisplay();
+      display.setCursor(0, 0);
+      display.println(F("Failed to connect to new Wi-Fi Retrying..."));
+      display.display();
+      return; // Exit function if maximum attempts reached
+    }
+  }
+}
+
+void smtpConnect() {
+  smtpAttempted = true;
+  lastAttemptTime = millis();
+  unsigned long startTime = millis();
+
+  while (millis() - startTime < authTimeout) {
+    if (smtp.connect(&config)) {
+      break;
+    }
+    delay(100); // wait for a short while before trying again
+  }
+
+  if (millis() - startTime >= authTimeout || !smtp.isLoggedIn()) {
+    display.clearDisplay();
+    display.setCursor(0, 20);
+    display.println(F("SMTP Authentication   Timeout or Failed"));
+    display.display();
+    lastAttemptTime = millis();
+    return;
+  }
+
+  if (smtp.isAuthenticated()) {
+    display.clearDisplay();
+    display.setCursor(0, 20);
+    display.println(F("Successfully logged  in. Standing by"));
+    display.display();
+    smtpConnected = true;
+  } else {
+    display.clearDisplay();
+    display.setCursor(0, 20);
+    display.println(F("Connected with no Auth."));
+    display.display();
+  }
+}
+
+void sendEmail() {
+  SMTP_Message message;
+
+  message.sender.name = F("Laser Alarm");        //Change the text inside "" to set the sender name of the ESP device shown in the notification email
+  message.sender.email = AUTHOR_EMAIL;
+  message.subject = F("DANGER!");        //Change the text inside "" to set the subject of the email
+  message.addRecipient(F("Anonto"), RECIPIENT_EMAIL);    //Change the text inside "" to set the recipient name for the notification email
+
+  String textMsg = "Laser Beam is Broken!!!";      //Change the text inside "" to set the email body of the notification email
+  message.text.content = textMsg.c_str();
+  message.text.charSet = "us-ascii";
+  message.text.transfer_encoding = Content_Transfer_Encoding::enc_7bit;
+
+  message.priority = esp_mail_smtp_priority::esp_mail_smtp_priority_low;
+  message.response.notify = esp_mail_smtp_notify_success | esp_mail_smtp_notify_failure | esp_mail_smtp_notify_delay;
+
+  display.clearDisplay();
+  display.setCursor(0, 30);
+  display.println(F("Email Sending..."));
+  display.display();
+
+  if (!MailClient.sendMail(&smtp, &message)) {
+    display.clearDisplay();
+    display.setCursor(0, 30);
+    display.println(F("Error sending email!"));
+    display.display();
+    ESP_MAIL_PRINTF("Error, Status Code: %d, Error Code: %d, Reason: %s", smtp.statusCode(), smtp.errorCode(), smtp.errorReason().c_str());
+  } else {
+    display.clearDisplay();
+    display.setCursor(0, 30);
+    display.println(F("Email sent           successfully!"));
+    display.display();
+    while (1); // Stay on this screen until reset
+  }
+}
+
+void smtpCallback(SMTP_Status status) {
+  Serial.println(status.info());
+
+  if (status.success()) {
+    Serial.println("----------------");
+    ESP_MAIL_PRINTF("Message sent success: %d\n", status.completedCount());
+    ESP_MAIL_PRINTF("Message sent failed: %d\n", status.failedCount());
+    Serial.println("----------------\n");
+
+    for (size_t i = 0; i < smtp.sendingResult.size(); i++) {
+      SMTP_Result result = smtp.sendingResult.getItem(i);
+
+      ESP_MAIL_PRINTF("Message No: %d\n", i + 1);
+      ESP_MAIL_PRINTF("Status: %s\n", result.completed ? "success" : "failed");
+      ESP_MAIL_PRINTF("Date/Time: %s\n", MailClient.Time.getDateTimeString(result.timestamp, "%B %d, %Y %H:%M:%S").c_str());
+      ESP_MAIL_PRINTF("Recipient: %s\n", result.recipients.c_str());
+      ESP_MAIL_PRINTF("Subject: %s\n", result.subject.c_str());
+    }
+    Serial.println("----------------\n");
+
+    smtp.sendingResult.clear();
+  }
+}
